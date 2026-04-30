@@ -346,7 +346,7 @@ class DigestPipeline:
         else:
             # 追加今日行
             new_row = {c: None for c in df.columns}
-            new_row['date'] = today
+            new_row['date'] = pd.Timestamp(today)
             new_row['open'] = open_p
             new_row['high'] = max(float(high_p), price)
             new_row['low'] = min(float(low_p), price)
