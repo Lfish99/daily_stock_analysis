@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] LLM 返回非 JSON 响应时同样触发备用模型切换：主模型成功返回但无法解析 JSON 时，不再立即降级为纯文本 fallback，而是依次尝试 `LITELLM_FALLBACK_MODELS` 中的备用模型；所有模型均无法返回合法 JSON 时，再降级为文本 fallback；all-models-invalid 场景的文本 fallback 现在会重新进入完整性校验、占位补全和 usage 持久化等既有后处理链路，且遵循 `REPORT_INTEGRITY_RETRY` 配置的重试次数再决定占位补全。
 - [改进] 问股页面支持组合选择多个 Agent 策略。
 - [修复] LiteLLM 内部 DEBUG 日志默认压低到 WARNING，避免流式生成时 token 级日志污染 `stock_analysis_debug_*.log`；如需排查 LiteLLM 内部细节，可临时设置 `LITELLM_LOG_LEVEL=DEBUG`（Fixes #1156）。
+- [修复] 每日选股雷达（`--digest`）财报日历改用 yfinance 并行补充：FMP 免费套餐覆盖率低（仅返回少量热门股），自选股中未被 FMP 覆盖的美股现在通过 yfinance `Ticker.calendar` 并行补充；同时修正财报查询范围从 screened-only 扩展到全部自选美股（含 screen 失败的股票）。
 - [改进] 新增 scripts/run-single-stock.ps1，支持单股快捷运行（默认 dry-run、默认不推送、默认跳过大盘复盘与自动回测）。
 - [文档] 新增 docs/single-stock-testing.md，整理单股测试推荐参数与常见命令组合。
 - [改进] 新增 scripts/run_single_stock.py（含详细注释），提供跨平台单股测试入口并封装常用参数。

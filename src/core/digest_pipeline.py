@@ -21,8 +21,8 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -66,6 +66,7 @@ class StockScreenResult:
     buy_signal: str = ""
     is_oversold: bool = False       # RSI(6) < RSI_OVERSOLD
     is_overbought: bool = False     # RSI(6) > RSI_OVERBOUGHT
+    realtime_used: bool = False     # 是否已用实时价格增强
     error: Optional[str] = None
 
     @property
@@ -162,18 +163,21 @@ class DigestPipeline:
                 logger.info("[Digest] 拉取 %d 只预警股票的新闻...", len(news_targets))
                 news_map = self._fetch_news_for_stocks(news_targets)
 
-        # 4. FMP 财报 & 宏观事件
+        # 4. FMP 财报 & 宏观事件 + yfinance 补充
         earnings: List[Dict] = []
         economic: List[Dict] = []
-        if not dry_run and self.fmp.is_available:
-            try:
-                # 只取自选股中的美股代码查询财报
-                us_codes = [r.code for r in screen_results if not r.error and _looks_like_us_stock(r.code)]
-                earnings = self.fmp.get_earnings_calendar(symbols=us_codes or None, days_ahead=7)
-                economic = self.fmp.get_economic_events(days_ahead=7, country="US")
-                logger.info("[Digest] FMP: %d 条财报, %d 条宏观事件", len(earnings), len(economic))
-            except Exception as exc:
-                logger.warning("[Digest] FMP 获取失败: %s", exc)
+        # 自选股中所有美股代码（无论 screen 是否出错都应检查财报）
+        us_codes_all = [c for c in codes if _looks_like_us_stock(c)]
+        if not dry_run:
+            if self.fmp.is_available:
+                try:
+                    earnings = self.fmp.get_earnings_calendar(symbols=us_codes_all or None, days_ahead=7)
+                    economic = self.fmp.get_economic_events(days_ahead=7, country="US")
+                    logger.info("[Digest] FMP: %d 条财报, %d 条宏观事件", len(earnings), len(economic))
+                except Exception as exc:
+                    logger.warning("[Digest] FMP 获取失败: %s", exc)
+            # yfinance 补充财报日历（FMP 免费套餐覆盖率低，只含少量热门股）
+            earnings = _supplement_earnings_yfinance(earnings, us_codes_all, days_ahead=7)
 
         # 5. 拼装报告
         report = self._format_report(
@@ -220,7 +224,12 @@ class DigestPipeline:
     # ------------------------------------------------------------------
 
     def _screen_one(self, code: str) -> StockScreenResult:
-        """抓取历史数据并计算技术指标，返回单只股票的筛选结果"""
+        """抓取历史数据并计算技术指标，返回单只股票的筛选结果。
+        
+        实时价格增强逻辑：
+        - 如果 enable_realtime_quote=True 且市场正在交易，用当前价格替换/追加今日 K 线。
+        - RSI 因此反映"此刻"而不是"昨日收盘"，让日内超买/超卖信号更及时。
+        """
         result = StockScreenResult(code=code, name=code)
         try:
             name = self.fetcher_manager.get_stock_name(code, allow_realtime=False) or code
@@ -230,6 +239,22 @@ class DigestPipeline:
             if df is None or df.empty or len(df) < 20:
                 result.error = f"数据不足（{len(df) if df is not None else 0} 行）"
                 return result
+
+            # 尝试用实时价格增强 df（让 RSI 反映当前行情）
+            realtime_quote = None
+            if getattr(self.config, 'enable_realtime_quote', True):
+                try:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(
+                        code, log_final_failure=False
+                    )
+                except Exception:
+                    pass
+
+            if realtime_quote is not None:
+                df_aug = self._augment_df_with_realtime(df, realtime_quote, code)
+                if df_aug is not df:
+                    df = df_aug
+                    result.realtime_used = True
 
             trend: TrendAnalysisResult = self.trend_analyzer.analyze(df, code)
 
@@ -244,7 +269,7 @@ class DigestPipeline:
             result.is_oversold = trend.rsi_6 < RSI_OVERSOLD
             result.is_overbought = trend.rsi_6 > RSI_OVERBOUGHT
 
-            # 日涨跌幅（最后两根 K 线之差）
+            # 日涨跌幅（最后两根 K 线之差；实时增强后最后一行即当前价格）
             df_sorted = df.sort_values('date').reset_index(drop=True)
             if len(df_sorted) >= 2:
                 prev_close = float(df_sorted.iloc[-2]['close'])
@@ -256,6 +281,80 @@ class DigestPipeline:
             logger.warning("[Digest] %s 计算失败: %s", code, exc)
             result.error = str(exc)
         return result
+
+    # ------------------------------------------------------------------
+    # 内部：实时价格增强（参考 pipeline.py _augment_historical_with_realtime）
+    # ------------------------------------------------------------------
+
+    def _augment_df_with_realtime(
+        self, df: pd.DataFrame, realtime_quote: Any, code: str
+    ) -> pd.DataFrame:
+        """
+        用实时行情价格更新/追加今日 K 线，让 RSI 等指标基于当前价格计算。
+
+        规则：
+        - 若最后一行日期 == 今日 → 更新 close/open/high/low/volume
+        - 若最后一行日期 < 今日（盘中数据未写入）→ 追加今日新行
+        - 如果 price 无效或解析失败 → 原样返回 df（fail-open）
+        """
+        if df is None or df.empty:
+            return df
+        price = getattr(realtime_quote, 'price', None)
+        if not (isinstance(price, (int, float)) and price > 0):
+            return df
+
+        try:
+            from src.core.trading_calendar import (
+                get_market_for_stock,
+                get_market_now,
+                is_market_open,
+            )
+            market = get_market_for_stock(code)
+            today = get_market_now(market).date()
+            # 只在交易时段增强（市场闭市时实时价格没有意义）
+            if market and not is_market_open(market, today):
+                return df
+        except Exception:
+            # 无法判断市场状态时直接跳过增强
+            return df
+
+        try:
+            last_val = df['date'].max()
+            last_date: date = (
+                last_val.date() if hasattr(last_val, 'date') else
+                (last_val if isinstance(last_val, date) else pd.Timestamp(last_val).date())
+            )
+        except Exception:
+            return df
+
+        yesterday_close = float(df.iloc[-1]['close'])
+        open_p = getattr(realtime_quote, 'open_price', None) or yesterday_close
+        high_p = getattr(realtime_quote, 'high', None) or price
+        low_p = getattr(realtime_quote, 'low', None) or price
+        vol = getattr(realtime_quote, 'volume', None) or 0
+
+        df = df.copy()
+        if last_date >= today:
+            # 更新已有今日行
+            idx = df.index[-1]
+            df.loc[idx, 'close'] = price
+            df.loc[idx, 'open'] = open_p
+            df.loc[idx, 'high'] = max(float(high_p), price)
+            df.loc[idx, 'low'] = min(float(low_p), price)
+            if vol:
+                df.loc[idx, 'volume'] = vol
+        else:
+            # 追加今日行
+            new_row = {c: None for c in df.columns}
+            new_row['date'] = today
+            new_row['open'] = open_p
+            new_row['high'] = max(float(high_p), price)
+            new_row['low'] = min(float(low_p), price)
+            new_row['close'] = price
+            new_row['volume'] = vol
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+        return df
 
     def _screen_all(self, codes: List[str]) -> List[StockScreenResult]:
         """并发抓取所有股票的技术指标"""
@@ -318,45 +417,36 @@ class DigestPipeline:
         now = datetime.now(tz_cn)
         lines: List[str] = []
 
+        # 是否有任何实时增强的结果
+        all_ok = flagged + normal
+        any_realtime = any(r.realtime_used for r in all_ok)
+        price_label = "价格(实时)" if any_realtime else "价格(收盘)"
+
         lines.append(f"# 每日选股雷达 {now.strftime('%Y-%m-%d %H:%M')} (CST)")
+        if any_realtime:
+            lines.append("")
+            lines.append("> RSI 已基于实时价格计算")
         lines.append("")
 
-        # --- RSI 预警 ---
-        if flagged:
-            lines.append("## RSI 预警")
-            lines.append("")
-            lines.append("| 股票 | 价格 | 日涨跌 | RSI(6) | RSI(12) | 状态 | 信号分 |")
-            lines.append("|------|------|--------|--------|---------|------|--------|")
-            for r in flagged:
-                change_str = _fmt_change(r.price_change_pct)
-                lines.append(
-                    f"| **{r.code}** {r.name} | {r.price:.2f} | {change_str} "
-                    f"| **{r.rsi_6}** | {r.rsi_12} | {r.rsi_alert_label} | {r.signal_score} |"
-                )
-            lines.append("")
-        else:
-            lines.append("## RSI 预警")
-            lines.append("")
-            lines.append(f"当前无 RSI < {RSI_OVERSOLD} 或 RSI > {RSI_OVERBOUGHT} 的股票。")
-            lines.append("")
-
-        # --- 全量指标 ---
-        all_ok = flagged + normal
+        # --- 合并表格：预警股票在前，普通股票在后 ---
         if all_ok:
-            lines.append("## 全量指标概览")
+            flagged_count = len(flagged)
+            if flagged_count:
+                lines.append(f"## 全量指标（{flagged_count} 只预警 / {len(all_ok)} 只）")
+            else:
+                lines.append(f"## 全量指标（{len(all_ok)} 只，当前无 RSI 预警）")
             lines.append("")
-            lines.append("| 股票 | 价格 | 日涨跌 | RSI(6) | MACD | 趋势 | 信号 | 评分 |")
-            lines.append("|------|------|--------|--------|------|------|------|------|")
+            lines.append(f"| 代码 | {price_label} | 日涨跌 | RSI(6) | RSI(12) | 预警 | MACD | 趋势 | 信号 | 评分 |")
+            lines.append("|------|------|--------|--------|---------|------|------|------|------|------|")
             for r in all_ok:
-                flag = " *" if r.is_flagged else ""
                 change_str = _fmt_change(r.price_change_pct)
+                alert = f"**{r.rsi_alert_label}**" if r.is_flagged else ""
+                rsi6_str = f"**{r.rsi_6}**" if r.is_flagged else str(r.rsi_6)
                 lines.append(
-                    f"| {r.code}{flag} | {r.price:.2f} | {change_str} "
-                    f"| {r.rsi_6} | {r.macd_status} | {r.trend_status} "
-                    f"| {r.buy_signal} | {r.signal_score} |"
+                    f"| {r.code} | {r.price:.2f} | {change_str} "
+                    f"| {rsi6_str} | {r.rsi_12} | {alert} "
+                    f"| {r.macd_status} | {r.trend_status} | {r.buy_signal} | {r.signal_score} |"
                 )
-            lines.append("")
-            lines.append("*注：* 标星（*）为 RSI 预警股票。")
             lines.append("")
 
         # --- 失败股票（简短提示）---
@@ -446,3 +536,86 @@ def _fmt_revenue(val) -> str:
         return f"${v:.0f}"
     except (TypeError, ValueError):
         return str(val)
+
+
+def _supplement_earnings_yfinance(
+    existing: List[Dict],
+    symbols: List[str],
+    days_ahead: int = 7,
+) -> List[Dict]:
+    """
+    用 yfinance 补充 FMP 财报日历未覆盖的股票。
+
+    FMP 免费套餐仅返回少量热门股票的财报日历；对于自选股中未被 FMP 覆盖的
+    股票，通过 yfinance Ticker.calendar 补充其下次财报日期。
+
+    Args:
+        existing:   已有的 FMP 财报列表（可为空）
+        symbols:    需要检查的美股代码列表（watchlist 中的所有美股）
+        days_ahead: 前向查看的交易日数（与 FMP 保持一致）
+
+    Returns:
+        合并后的财报列表（已去重，按日期排序）
+    """
+    from data_provider.fmp_fetcher import _next_n_trading_days
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.debug("[Digest] yfinance 未安装，跳过财报补充")
+        return existing
+
+    if not symbols:
+        return existing
+
+    start, end = _next_n_trading_days(days_ahead)
+    covered = {e.get("symbol", "").upper() for e in existing}
+    to_fetch = [s for s in symbols if s.upper() not in covered]
+
+    if not to_fetch:
+        return existing
+
+    extra: List[Dict] = []
+
+    def _fetch_one(sym: str) -> Optional[Dict]:
+        try:
+            cal = yf.Ticker(sym).calendar
+            if not cal or "Earnings Date" not in cal:
+                return None
+            dates = cal["Earnings Date"]
+            if not isinstance(dates, list):
+                dates = [dates]
+            for d in dates:
+                if not isinstance(d, date):
+                    try:
+                        d = date.fromisoformat(str(d)[:10])
+                    except Exception:
+                        continue
+                if start <= d <= end:
+                    return {
+                        "symbol":           sym.upper(),
+                        "date":             str(d),
+                        "time":             "",
+                        "eps_estimate":     cal.get("Earnings Average"),
+                        "revenue_estimate": cal.get("Revenue Average"),
+                        "fiscal_year":      "",
+                        "fiscal_quarter":   "",
+                    }
+        except Exception as exc:
+            logger.debug("[Digest] yfinance 财报补充 %s 失败: %s", sym, exc)
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(to_fetch))) as executor:
+        futures = {executor.submit(_fetch_one, s): s for s in to_fetch}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                extra.append(result)
+
+    if extra:
+        logger.info("[Digest] yfinance 补充财报 %d 条: %s",
+                    len(extra), [e["symbol"] for e in extra])
+        combined = existing + extra
+        combined.sort(key=lambda x: x.get("date", ""))
+        return combined
+
+    return existing
