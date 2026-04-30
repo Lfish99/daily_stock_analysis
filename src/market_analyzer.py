@@ -24,6 +24,7 @@ from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
 from data_provider.base import DataFetcherManager
+from data_provider.fmp_fetcher import FmpFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ class MarketAnalyzer:
         self.region = region if region in ("cn", "us", "hk") else "cn"
         self.profile: MarketProfile = get_profile(self.region)
         self.strategy = get_market_strategy_blueprint(self.region)
+        self.fmp = FmpFetcher(api_key=getattr(self.config, 'fmp_api_key', None) or "")
 
     def _get_review_language(self) -> str:
         configured = normalize_report_language(
@@ -442,13 +444,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         return all_news
     
-    def generate_market_review(self, overview: MarketOverview, news: List) -> str:
+    def generate_market_review(self, overview: MarketOverview, news: List, upcoming_events_block: str = "") -> str:
         """
         使用大模型生成大盘复盘报告
         
         Args:
             overview: 市场概览数据
             news: 市场新闻列表 (SearchResult 对象列表)
+            upcoming_events_block: FMP 未来事件日历文本（可选）
             
         Returns:
             大盘复盘报告文本
@@ -458,7 +461,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return self._generate_template_review(overview, news)
         
         # 构建 Prompt
-        prompt = self._build_review_prompt(overview, news)
+        prompt = self._build_review_prompt(overview, news, upcoming_events_block=upcoming_events_block)
         
         logger.info("[大盘] 调用大模型生成复盘报告...")
         # Use the public generate_text() entry point — never access private analyzer attributes.
@@ -736,7 +739,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 label = "偏弱"
         return score, label
 
-    def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
+    def _build_review_prompt(self, overview: MarketOverview, news: List, upcoming_events_block: str = "") -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
 
@@ -815,6 +818,7 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 
         if review_language == "en":
             report_title = self._get_review_title(overview.date).removeprefix("## ").strip()
+            events_section = f"\n{upcoming_events_block}\n" if upcoming_events_block else ""
             return f"""You are a professional US/A/H market analyst. Please produce a concise market recap report based on the data below.
 
 [Requirements]
@@ -841,8 +845,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 ## Market News
 {news_placeholder}
 
+{events_section}
 {data_no_indices_hint}
-
 {self._get_strategy_prompt_block()}
 
 ---
@@ -904,6 +908,8 @@ Output the report content directly, no extra commentary.
 
 ## 市场新闻
 {news_placeholder}
+
+{upcoming_events_block}
 
 {data_no_indices_hint}
 
@@ -1059,6 +1065,26 @@ Market conditions can change quickly. The data above is for reference only and d
 *复盘时间: {datetime.now().strftime('%H:%M')}*
 """
     
+    def _fetch_upcoming_events_block(self, lang: str = "zh") -> str:
+        """
+        获取未来 5 个交易日宏观事件块，给 prompt 用。
+
+        时间窗口从明日起算（跳过周末），规避“周五查当周”问题。
+        """
+        if not self.fmp.is_available:
+            logger.debug("[FMP] 未配置 FMP_API_KEY，跳过事件日历获取")
+            if lang == "en":
+                return "## Upcoming Events\n_Configure FMP_API_KEY to enable macro & earnings calendar._"
+            return "## 未来事件日历\n_配置 FMP_API_KEY 后可自动获取 FOMC、CPI、财报日期等事件。_"
+
+        try:
+            economic = self.fmp.get_economic_events(days_ahead=5)
+            earnings = self.fmp.get_earnings_calendar(days_ahead=5)
+            return self.fmp.format_events_for_prompt(economic, earnings, lang=lang)
+        except Exception as e:
+            logger.warning(f"[FMP] 获取事件日历失败: {e}")
+            return ""
+
     def run_daily_review(self) -> str:
         """
         执行每日大盘复盘流程
@@ -1073,9 +1099,13 @@ Market conditions can change quickly. The data above is for reference only and d
         
         # 2. 搜索市场新闻
         news = self.search_market_news()
+
+        # 3. 获取未来事件日历（FMP）
+        lang = self._get_review_language()
+        upcoming_block = self._fetch_upcoming_events_block(lang=lang)
         
-        # 3. 生成复盘报告
-        report = self.generate_market_review(overview, news)
+        # 4. 生成复盘报告
+        report = self.generate_market_review(overview, news, upcoming_events_block=upcoming_block)
         
         logger.info("========== 大盘复盘分析完成 ==========")
         

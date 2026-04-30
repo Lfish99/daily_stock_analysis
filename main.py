@@ -275,6 +275,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--digest',
+        action='store_true',
+        help='运行每日选股雷达（轻量全量技术筛选：RSI预警 + 指标概览 + 新闻 + 财报/宏观日历）'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -876,6 +882,19 @@ def main() -> int:
                 search_service=search_service,
                 send_notification=not args.no_notify,
                 override_region=effective_region,
+            )
+            return 0
+
+        # 模式1.5: 每日选股雷达（轻量全量技术筛选）
+        if getattr(args, 'digest', False):
+            logger.info("模式: 每日选股雷达")
+            from src.core.digest_pipeline import DigestPipeline
+
+            pipeline = DigestPipeline(config)
+            pipeline.run_and_send(
+                stock_codes=stock_codes,
+                dry_run=getattr(args, 'dry_run', False),
+                no_notify=getattr(args, 'no_notify', False),
             )
             return 0
 

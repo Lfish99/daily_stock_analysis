@@ -32,7 +32,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
-from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
+from .realtime_types import UnifiedRealtimeQuote, RealtimeSource, ChipDistribution, safe_float
 from .us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
 
 # 可选导入本地股票映射补丁，若缺失则使用空字典兜底
@@ -765,6 +765,146 @@ class YfinanceFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Yfinance] 获取美股 {stock_code} 实时行情失败: {e}，尝试 Stooq 兜底")
             return self._get_us_stock_quote_from_stooq(stock_code)
+
+    def get_chip_distribution(self, stock_code: str):
+        """
+        用 Volume Profile 方法为美股构建筹码分布近似值。
+
+        由于美股没有 A 股那样的官方筹码分布接口，这里用近 60 日
+        OHLCV 数据做量价分布估算，得出与 ChipDistribution 字段语义
+        对齐的指标，供 LLM 分析时参考。
+
+        算法说明：
+        1. 取近 60 日日线数据，每日典型价 = (High + Low + Close) / 3。
+        2. 以 100 个价格桶将价格区间均匀分段，把成交量按典型价落入对应桶。
+        3. 从低到高累加成交量，计算各分位对应的价格区间：
+           - 70% 成交量所在区间 → cost_70_low / cost_70_high
+           - 90% 成交量所在区间 → cost_90_low / cost_90_high
+        4. 集中度 = (cost_Xh - cost_Xl) / current_price （越小越集中）
+        5. profit_ratio = 典型价低于当前价的成交量 / 总成交量（获利盘比例）
+        6. avg_cost = VWAP（成交量加权平均典型价）
+
+        仅处理美股代码，非美股直接返回 None。
+
+        Returns:
+            ChipDistribution 对象，失败或非美股返回 None
+        """
+        import yfinance as yf
+        import numpy as np
+        from datetime import date, timedelta
+
+        # 仅处理美股股票，指数跳过（无持仓语义）
+        _, index_name = get_us_index_yf_symbol(stock_code)
+        if index_name:
+            logger.debug(f"[Yfinance筹码] {stock_code} 是指数，跳过筹码分布")
+            return None
+
+        if not self._is_us_stock(stock_code):
+            logger.debug(f"[Yfinance筹码] {stock_code} 不是美股，跳过")
+            return None
+
+        try:
+            symbol = stock_code.strip().upper()
+            end_dt = date.today()
+            start_dt = end_dt - timedelta(days=90)  # 多取一点，过滤后约 60 个交易日
+
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(start=start_dt.isoformat(), end=end_dt.isoformat(), auto_adjust=True)
+
+            if hist is None or hist.empty:
+                logger.warning(f"[Yfinance筹码] {symbol} 无历史数据，跳过")
+                return None
+
+            # 只保留最近 60 个交易日
+            hist = hist.tail(60)
+
+            close_arr = hist["Close"].values.astype(float)
+            high_arr = hist["High"].values.astype(float)
+            low_arr = hist["Low"].values.astype(float)
+            vol_arr = hist["Volume"].values.astype(float)
+
+            # 过滤零成交量（停牌日）
+            mask = vol_arr > 0
+            close_arr = close_arr[mask]
+            high_arr = high_arr[mask]
+            low_arr = low_arr[mask]
+            vol_arr = vol_arr[mask]
+
+            if len(close_arr) < 5:
+                logger.warning(f"[Yfinance筹码] {symbol} 有效交易日不足 5 天，跳过")
+                return None
+
+            # 典型价（HLC/3）
+            typical_arr = (high_arr + low_arr + close_arr) / 3.0
+            current_price = float(close_arr[-1])
+            latest_date = str(hist.index[-1].date())
+
+            # --- VWAP（平均成本）---
+            total_vol = vol_arr.sum()
+            vwap = float((typical_arr * vol_arr).sum() / total_vol) if total_vol > 0 else current_price
+
+            # --- 获利盘比例 ---
+            profit_vol = vol_arr[typical_arr < current_price].sum()
+            profit_ratio = float(profit_vol / total_vol) if total_vol > 0 else 0.0
+
+            # --- Volume Profile：100 个价格桶 ---
+            price_min = float(np.min(low_arr))
+            price_max = float(np.max(high_arr))
+            if price_max <= price_min:
+                price_max = price_min * 1.01  # 防止区间为零
+
+            n_bins = 100
+            bins = np.linspace(price_min, price_max, n_bins + 1)
+            bin_vols = np.zeros(n_bins)
+            for i in range(len(typical_arr)):
+                idx = int((typical_arr[i] - price_min) / (price_max - price_min) * n_bins)
+                idx = max(0, min(n_bins - 1, idx))
+                bin_vols[idx] += vol_arr[i]
+
+            cum_vol = np.cumsum(bin_vols)
+            cum_pct = cum_vol / total_vol
+
+            def _price_at_pct(pct: float) -> float:
+                """返回累积成交量达到 pct 时对应的价格"""
+                idx = int(np.searchsorted(cum_pct, pct))
+                idx = min(idx, n_bins - 1)
+                return float(bins[idx])
+
+            # 70% / 90% 区间的下沿取 (1-pct)/2，上沿取 (1+pct)/2
+            cost_70_low = _price_at_pct((1.0 - 0.70) / 2)
+            cost_70_high = _price_at_pct(1.0 - (1.0 - 0.70) / 2)
+            cost_90_low = _price_at_pct((1.0 - 0.90) / 2)
+            cost_90_high = _price_at_pct(1.0 - (1.0 - 0.90) / 2)
+
+            # 集中度：区间宽度 / 当前价（无量纲，越小越集中）
+            concentration_70 = (cost_70_high - cost_70_low) / current_price if current_price > 0 else 0.0
+            concentration_90 = (cost_90_high - cost_90_low) / current_price if current_price > 0 else 0.0
+
+            chip = ChipDistribution(
+                code=symbol,
+                date=latest_date,
+                source="yfinance_volume_profile",
+                profit_ratio=round(profit_ratio, 4),
+                avg_cost=round(vwap, 4),
+                cost_90_low=round(cost_90_low, 4),
+                cost_90_high=round(cost_90_high, 4),
+                concentration_90=round(concentration_90, 4),
+                cost_70_low=round(cost_70_low, 4),
+                cost_70_high=round(cost_70_high, 4),
+                concentration_70=round(concentration_70, 4),
+            )
+
+            logger.info(
+                f"[Yfinance筹码] {symbol} date={latest_date}: "
+                f"获利盘={chip.profit_ratio:.1%}, VWAP={chip.avg_cost:.2f}, "
+                f"90%区间=[{chip.cost_90_low:.2f}, {chip.cost_90_high:.2f}] "
+                f"集中度={chip.concentration_90:.2%}"
+            )
+            return chip
+
+        except Exception as e:
+            logger.warning(f"[Yfinance筹码] {stock_code} 筹码分布计算失败: {e}")
+            return None
 
 
 if __name__ == "__main__":

@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] LLM 返回非 JSON 响应时同样触发备用模型切换：主模型成功返回但无法解析 JSON 时，不再立即降级为纯文本 fallback，而是依次尝试 `LITELLM_FALLBACK_MODELS` 中的备用模型；所有模型均无法返回合法 JSON 时，再降级为文本 fallback；all-models-invalid 场景的文本 fallback 现在会重新进入完整性校验、占位补全和 usage 持久化等既有后处理链路，且遵循 `REPORT_INTEGRITY_RETRY` 配置的重试次数再决定占位补全。
 - [改进] 问股页面支持组合选择多个 Agent 策略。
 - [修复] LiteLLM 内部 DEBUG 日志默认压低到 WARNING，避免流式生成时 token 级日志污染 `stock_analysis_debug_*.log`；如需排查 LiteLLM 内部细节，可临时设置 `LITELLM_LOG_LEVEL=DEBUG`（Fixes #1156）。
+- [改进] 新增 scripts/run-single-stock.ps1，支持单股快捷运行（默认 dry-run、默认不推送、默认跳过大盘复盘与自动回测）。
+- [文档] 新增 docs/single-stock-testing.md，整理单股测试推荐参数与常见命令组合。
+- [改进] 新增 scripts/run_single_stock.py（含详细注释），提供跨平台单股测试入口并封装常用参数。
+- [文档] 更新 docs/single-stock-testing.md，补充单股测试后的报告输出目录与文件命名说明。
+- [文档] 新增 docs/us-stock-analysis-flow.md，梳理美股个股分析链路（数据源、量能结论、技能注入与 LLM Prompt 组装）。
+- [新功能] YfinanceFetcher 新增 get_chip_distribution，用 Volume Profile 算法为美股构建筹码分布近似值（获利盘比例、VWAP、70%/90% 成本区间与集中度），无需修改 base.py 即自动接入现有 fallback 链路。
+- [新功能] 新增 data_provider/fmp_fetcher.py，接入 FMP 经济日历（FOMC/CPI/非农等）与财报日历；时间窗口为未来 5 个交易日（从明日起算，跳过周末），规避"周五查当周"遗漏下周事件的问题。
+- [改进] market_analyzer.py 大盘复盘 prompt 注入 FMP 宏观事件块（A 股和美股均支持），帮助 LLM 生成含"本周重要事件前瞻"的报告；FMP_API_KEY 未配置时优雅降级，不影响主流程。
+- [文档] 新增 scripts/explore_fmp.py，FMP 接口交互式探索脚本，支持经济日历/财报日历/格式化 Prompt 块查看。
+- [文档] 新增 docs/upcoming-events-guide.md，梳理三种重要事件提醒方案（yfinance calendar、FMP、Alpha Vantage）及选型建议。
+- [chore] .env.example 新增 FMP_API_KEY 配置项说明；src/config.py Config 新增 fmp_api_key 字段。
+- [新功能] 新增 src/core/digest_pipeline.py：每日选股雷达模式，对全量自选股并发计算 RSI/MACD/趋势/信号分，识别超卖（RSI<30）/超买（RSI>75）预警，为预警股票拉新闻摘要，注入 FMP 财报日历和高影响力宏观事件，生成一份汇总 Markdown 推送，无需 LLM 逐股分析。
+- [改进] main.py 新增 --digest 命令行参数，对应每日选股雷达模式（支持 --stocks 覆盖股票列表、--dry-run 跳过新闻/FMP、--no-notify 不推送）。
+- [改进] .github/workflows/daily_analysis.yml workflow_dispatch 新增 digest 模式选项，并将 FMP_API_KEY 注入工作流环境。
 
 ## [3.14.1] - 2026-04-26
 - [测试] 修正大盘复盘 prompt 测试对“明日交易计划”标题的断言，并同步桌面端版本号，恢复发布 gate。

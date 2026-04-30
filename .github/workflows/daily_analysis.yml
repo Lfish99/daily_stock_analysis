@@ -17,6 +17,7 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+          - digest        # 每日选股雷达（轻量全量筛选）
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -200,6 +201,8 @@ jobs:
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
           SEARXNG_BASE_URLS: ${{ secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          # Financial Modeling Prep（财报日历 + 宏观事件，digest 模式使用）
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -363,6 +366,8 @@ jobs:
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
+          elif [ "$MODE" = "digest" ]; then
+            python main.py --digest $FORCE_RUN_ARG
           else
             python main.py $FORCE_RUN_ARG
           fi
