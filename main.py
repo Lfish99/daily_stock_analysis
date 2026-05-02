@@ -665,6 +665,21 @@ def start_bot_stream_clients(config: Config) -> None:
         except Exception as exc:
             logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
 
+    # 启动 Discord Gateway 客户端（本地/服务器常驻，无需公网 IP）
+    if getattr(config, 'discord_gateway_enabled', False):
+        try:
+            from bot.platforms import start_discord_gateway_background, DISCORD_PY_AVAILABLE
+            if DISCORD_PY_AVAILABLE:
+                if start_discord_gateway_background():
+                    logger.info("[Main] Discord Gateway client started in background.")
+                else:
+                    logger.warning("[Main] Discord Gateway client failed to start.")
+            else:
+                logger.warning("[Main] Discord Gateway enabled but discord.py is missing.")
+                logger.warning("[Main] Run: pip install discord.py")
+        except Exception as exc:
+            logger.error(f"[Main] Failed to start Discord Gateway client: {exc}")
+
 
 def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
     """Scheduled runs should always read the latest persisted watchlist."""

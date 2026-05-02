@@ -16,8 +16,15 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 
 import requests
-from nacl.exceptions import BadSignatureError
-from nacl.signing import VerifyKey
+
+try:
+    from nacl.exceptions import BadSignatureError
+    from nacl.signing import VerifyKey
+    _NACL_AVAILABLE = True
+except ImportError:
+    _NACL_AVAILABLE = False
+    BadSignatureError = Exception  # type: ignore[misc,assignment]
+    VerifyKey = None  # type: ignore[assignment]
 
 from bot.platforms.base import BotPlatform
 from bot.models import BotMessage, WebhookResponse, ChatType
@@ -91,6 +98,9 @@ class DiscordPlatform(BotPlatform):
             return False
 
         try:
+            if not _NACL_AVAILABLE:
+                logger.warning("[Discord] PyNaCl 未安装，无法验签，拒绝请求。请运行: pip install PyNaCl")
+                return False
             verify_key = VerifyKey(bytes.fromhex(self._interactions_public_key))
             signature_bytes = bytes.fromhex(signature)
         except ValueError:

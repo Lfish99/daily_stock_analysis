@@ -735,6 +735,7 @@ class Config:
     discord_main_channel_id: Optional[str] = None  # Discord 主频道 ID
     discord_webhook_url: Optional[str] = None  # Discord Webhook URL
     discord_interactions_public_key: Optional[str] = None  # Discord Interaction 入站验签公钥
+    discord_gateway_enabled: bool = False  # 是否启用 Gateway 模式（本地/服务器常驻，无需公网 IP）
 
     # Slack 通知配置
     slack_webhook_url: Optional[str] = None  # Slack Incoming Webhook URL
@@ -1420,6 +1421,7 @@ class Config:
             ),
             discord_webhook_url=os.getenv('DISCORD_WEBHOOK_URL'),
             discord_interactions_public_key=os.getenv('DISCORD_INTERACTIONS_PUBLIC_KEY'),
+            discord_gateway_enabled=os.getenv('DISCORD_GATEWAY_ENABLED', 'false').lower() == 'true',
             slack_webhook_url=os.getenv('SLACK_WEBHOOK_URL'),
             slack_bot_token=os.getenv('SLACK_BOT_TOKEN'),
             slack_channel_id=os.getenv('SLACK_CHANNEL_ID'),

@@ -13,10 +13,14 @@
 
 from bot.platforms.base import BotPlatform
 from bot.platforms.dingtalk import DingtalkPlatform
+from bot.platforms.discord import DiscordPlatform
+from bot.platforms.wecom import WecomPlatform
 
 # 所有可用平台（Webhook 模式）
 ALL_PLATFORMS = {
     'dingtalk': DingtalkPlatform,
+    'discord': DiscordPlatform,
+    'wecom': WecomPlatform,
 }
 
 # 钉钉 Stream 模式（可选）
@@ -53,9 +57,25 @@ except ImportError:
     get_feishu_stream_client = lambda: None
     start_feishu_stream_background = lambda: False
 
+# Discord Gateway 模式（本地/服务器常驻，无需公网 IP）
+try:
+    from bot.platforms.discord_gateway import (
+        DiscordGatewayClient,
+        get_discord_gateway_client,
+        start_discord_gateway_background,
+        DISCORD_PY_AVAILABLE,
+    )
+except ImportError:
+    DISCORD_PY_AVAILABLE = False
+    DiscordGatewayClient = None
+    get_discord_gateway_client = lambda: None
+    start_discord_gateway_background = lambda: False
+
 __all__ = [
     'BotPlatform',
     'DingtalkPlatform',
+    'DiscordPlatform',
+    'WecomPlatform',
     'ALL_PLATFORMS',
     # 钉钉 Stream 模式
     'DingtalkStreamClient',
@@ -70,4 +90,9 @@ __all__ = [
     'get_feishu_stream_client',
     'start_feishu_stream_background',
     'FEISHU_SDK_AVAILABLE',
+    # Discord Gateway 模式
+    'DiscordGatewayClient',
+    'get_discord_gateway_client',
+    'start_discord_gateway_background',
+    'DISCORD_PY_AVAILABLE',
 ]
