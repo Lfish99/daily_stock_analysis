@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 问股页面支持组合选择多个 Agent 策略。
 - [修复] LiteLLM 内部 DEBUG 日志默认压低到 WARNING，避免流式生成时 token 级日志污染 `stock_analysis_debug_*.log`；如需排查 LiteLLM 内部细节，可临时设置 `LITELLM_LOG_LEVEL=DEBUG`（Fixes #1156）。
 - [修复] 每日选股雷达（`--digest`）财报日历改用 yfinance 并行补充：FMP 免费套餐覆盖率低（仅返回少量热门股），自选股中未被 FMP 覆盖的美股现在通过 yfinance `Ticker.calendar` 并行补充；同时修正财报查询范围从 screened-only 扩展到全部自选美股（含 screen 失败的股票）。
+- [新功能] 企业微信自建应用接收消息（Bot 模式）：新增 `bot/platforms/wecom.py`（AES-256-CBC 解密 + 签名验证）、`bot/commands/digest.py`（`/digest` 命令触发选股雷达）、`api/v1/endpoints/bot.py`（`GET/POST /api/v1/bot/wecom`）；在企业微信管理后台配置回调 URL 后，向应用发送 `/digest` 或 `雷达` 即可触发每日选股雷达扫描。
 - [改进] 新增 scripts/run-single-stock.ps1，支持单股快捷运行（默认 dry-run、默认不推送、默认跳过大盘复盘与自动回测）。
 - [文档] 新增 docs/single-stock-testing.md，整理单股测试推荐参数与常见命令组合。
 - [改进] 新增 scripts/run_single_stock.py（含详细注释），提供跨平台单股测试入口并封装常用参数。
@@ -38,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增 src/core/digest_pipeline.py：每日选股雷达模式，对全量自选股并发计算 RSI/MACD/趋势/信号分，识别超卖（RSI<30）/超买（RSI>75）预警，为预警股票拉新闻摘要，注入 FMP 财报日历和高影响力宏观事件，生成一份汇总 Markdown 推送，无需 LLM 逐股分析。
 - [改进] main.py 新增 --digest 命令行参数，对应每日选股雷达模式（支持 --stocks 覆盖股票列表、--dry-run 跳过新闻/FMP、--no-notify 不推送）。
 - [改进] .github/workflows/daily_analysis.yml workflow_dispatch 新增 digest 模式选项，并将 FMP_API_KEY 注入工作流环境。
+- [新功能] Bot 新增 `/stock <股票代码>` 轻量查询命令（返回价格、RSI、趋势、信号、MA 与买卖参考），并支持将 `/<股票代码>`（如 `/lite`）自动路由为 `/stock lite`，便于在 Discord 直接按代码查询。
+- [新功能] 新增 Discord 入站回调 `POST /api/v1/bot/discord`，并将 Discord 平台注册到 Bot Webhook 路由；配置 `DISCORD_INTERACTIONS_PUBLIC_KEY` 后可接收 Slash Command 并返回命令结果。
 
 ## [3.14.1] - 2026-04-26
 - [测试] 修正大盘复盘 prompt 测试对“明日交易计划”标题的断言，并同步桌面端版本号，恢复发布 gate。
