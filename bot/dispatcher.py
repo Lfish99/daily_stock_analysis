@@ -273,6 +273,16 @@ class CommandDispatcher:
         logger.info(f"[Dispatcher] 收到命令: {cmd_name}, 参数: {args}, 用户: {message.user_name}")
 
         command = self.get_command(cmd_name)
+
+        # 兼容 `/LITE` 这种把股票代码当命令名的输入：自动路由到 /stock LITE
+        if command is None and not args and self._looks_like_stock_code(cmd_name):
+            stock_command = self.get_command("stock")
+            if stock_command is not None:
+                logger.info("[Dispatcher] 将未知命令 /%s 自动路由为 /stock %s", cmd_name, cmd_name)
+                command = stock_command
+                args = [cmd_name]
+                cmd_name = stock_command.name
+
         if command is None:
             return cmd_name, args, None, BotResponse.error_response(
                 f"未知命令: {cmd_name}\n"
@@ -289,6 +299,18 @@ class CommandDispatcher:
             )
 
         return cmd_name, args, command, None
+
+    @staticmethod
+    def _looks_like_stock_code(token: str) -> bool:
+        t = (token or "").upper().strip()
+        if not t:
+            return False
+        # A股: 6位数字；港股: HK+5位数字；美股: 1-5字母(可带 .A/.B)
+        return bool(
+            re.match(r'^\d{6}$', t)
+            or re.match(r'^HK\d{5}$', t)
+            or re.match(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$', t)
+        )
 
     def _dispatch_sync(self, message: BotMessage) -> BotResponse:
         """Pure synchronous dispatch path for webhook/stream integrations."""
