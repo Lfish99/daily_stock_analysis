@@ -49,6 +49,25 @@ HISTORY_DAYS = 90
 # 并发抓取数据的最大线程数
 MAX_FETCH_WORKERS = 8
 
+# 信号优先级排序（强烈买入 → 买入 → 持有 → 观望 → 卖出 → 强烈卖出）
+_SIGNAL_ORDER = {
+    "强烈买入": 0,
+    "买入":     1,
+    "持有":     2,
+    "观望":     3,
+    "卖出":     4,
+    "强烈卖出": 5,
+}
+
+_SIGNAL_EMOJI = {
+    "强烈买入": "🔥",
+    "买入":     "✅",
+    "持有":     "➡️",
+    "观望":     "⏳",
+    "卖出":     "⚠️",
+    "强烈卖出": "🚨",
+}
+
 
 @dataclass
 class StockScreenResult:
@@ -68,6 +87,12 @@ class StockScreenResult:
     is_overbought: bool = False     # RSI(6) > RSI_OVERBOUGHT
     realtime_used: bool = False     # 是否已用实时价格增强
     error: Optional[str] = None
+    signal_reasons: List[str] = field(default_factory=list)
+    risk_factors: List[str] = field(default_factory=list)
+    ma5: float = 0.0
+    ma10: float = 0.0
+    ma20: float = 0.0
+    resistance_levels: List[float] = field(default_factory=list)
 
     @property
     def is_flagged(self) -> bool:
@@ -142,25 +167,26 @@ class DigestPipeline:
         # 1. 全量技术指标计算（并发）
         screen_results = self._screen_all(codes)
 
-        # 2. 按预警/信号分排序
-        flagged = [r for r in screen_results if r.is_flagged and not r.error]
-        normal = [r for r in screen_results if not r.is_flagged and not r.error]
+        # 2. 分离成功/失败，成功的按信号优先级排序（所有股票一视同仁）
+        ok_results = [r for r in screen_results if not r.error]
         failed = [r for r in screen_results if r.error]
 
-        flagged.sort(key=lambda r: r.rsi_6)               # 超卖在前（RSI 从小到大）
-        normal.sort(key=lambda r: r.signal_score, reverse=True)  # 高分在前
+        # 按信号优先级排序（强烈买入 → 买入 → 持有 → 观望 → 卖出 → 强烈卖出），同级内按评分降序
+        ok_results.sort(key=lambda r: (_SIGNAL_ORDER.get(r.buy_signal, 3), -r.signal_score))
 
         logger.info(
-            "[Digest] 技术扫描完成: 共 %d 只, 预警 %d 只, 正常 %d 只, 失败 %d 只, 耗时 %.1fs",
-            len(screen_results), len(flagged), len(normal), len(failed), time.time() - t0,
+            "[Digest] 技术扫描完成: 共 %d 只, 成功 %d 只, 失败 %d 只, 耗时 %.1fs",
+            len(screen_results), len(ok_results), len(failed), time.time() - t0,
         )
 
-        # 3. 预警股票拉新闻（可选，受 dry_run 控制）
+        # 3. 高优先级股票拉新闻（可选，受 dry_run 控制）
         news_map: Dict[str, List[str]] = {}
         if not dry_run and self.search_service and self.search_service.is_available:
-            news_targets = flagged[:MAX_NEWS_STOCKS]
+            # 优先选择强烈买入/买入的股票拉新闻
+            buy_signals = [r for r in ok_results if r.buy_signal in ("强烈买入", "买入")]
+            news_targets = buy_signals[:MAX_NEWS_STOCKS]
             if news_targets:
-                logger.info("[Digest] 拉取 %d 只预警股票的新闻...", len(news_targets))
+                logger.info("[Digest] 拉取 %d 只买入信号股票的新闻...", len(news_targets))
                 news_map = self._fetch_news_for_stocks(news_targets)
 
         # 4. FMP 财报 & 宏观事件 + yfinance 补充
@@ -181,8 +207,7 @@ class DigestPipeline:
 
         # 5. 拼装报告
         report = self._format_report(
-            flagged=flagged,
-            normal=normal,
+            results=ok_results,
             failed=failed,
             news_map=news_map,
             earnings=earnings,
@@ -266,6 +291,12 @@ class DigestPipeline:
             result.trend_status = trend.trend_status.value
             result.signal_score = trend.signal_score
             result.buy_signal = trend.buy_signal.value
+            result.signal_reasons = list(trend.signal_reasons or [])
+            result.risk_factors = list(trend.risk_factors or [])
+            result.ma5 = round(float(trend.ma5 or 0), 2)
+            result.ma10 = round(float(trend.ma10 or 0), 2)
+            result.ma20 = round(float(trend.ma20 or 0), 2)
+            result.resistance_levels = [round(float(x), 2) for x in (trend.resistance_levels or [])]
             result.is_oversold = trend.rsi_6 < RSI_OVERSOLD
             result.is_overbought = trend.rsi_6 > RSI_OVERBOUGHT
 
@@ -406,8 +437,7 @@ class DigestPipeline:
 
     def _format_report(
         self,
-        flagged: List[StockScreenResult],
-        normal: List[StockScreenResult],
+        results: List[StockScreenResult],
         failed: List[StockScreenResult],
         news_map: Dict[str, List[str]],
         earnings: List[Dict],
@@ -417,9 +447,8 @@ class DigestPipeline:
         now = datetime.now(tz_cn)
         lines: List[str] = []
 
-        # 是否有任何实时增强的结果
-        all_ok = flagged + normal
-        any_realtime = any(r.realtime_used for r in all_ok)
+        # 结果已经按信号优先级排序（强烈买入 → 买入 → 持有 → 观望 → 卖出 → 强烈卖出）
+        any_realtime = any(r.realtime_used for r in results)
         price_label = "价格(实时)" if any_realtime else "价格(收盘)"
 
         lines.append(f"# 每日选股雷达 {now.strftime('%Y-%m-%d %H:%M')} (CST)")
@@ -428,17 +457,13 @@ class DigestPipeline:
             lines.append("> RSI 已基于实时价格计算")
         lines.append("")
 
-        # --- 合并表格：预警股票在前，普通股票在后 ---
-        if all_ok:
-            flagged_count = len(flagged)
-            if flagged_count:
-                lines.append(f"## 全量指标（{flagged_count} 只预警 / {len(all_ok)} 只）")
-            else:
-                lines.append(f"## 全量指标（{len(all_ok)} 只，当前无 RSI 预警）")
+        # --- 概览表格（按信号排序）---
+        if results:
+            lines.append(f"## 全量指标（{len(results)} 只，按信号优先级排序）")
             lines.append("")
             lines.append(f"| 代码 | {price_label} | 日涨跌 | RSI(6) | RSI(12) | 预警 | MACD | 趋势 | 信号 | 评分 |")
-            lines.append("|------|------|--------|--------|---------|------|------|------|------|------|")
-            for r in all_ok:
+            lines.append("|------|------|--------|--------|---------|------|------|------|------|------|") 
+            for r in results:
                 change_str = _fmt_change(r.price_change_pct)
                 alert = f"**{r.rsi_alert_label}**" if r.is_flagged else ""
                 rsi6_str = f"**{r.rsi_6}**" if r.is_flagged else str(r.rsi_6)
@@ -457,11 +482,30 @@ class DigestPipeline:
             lines.append(f"> 数据获取失败（已跳过）: {codes_str}")
             lines.append("")
 
+        # --- 个股买卖参考 ---
+        if results:
+            lines.append("## 个股买卖参考")
+            lines.append("")
+            for r in results:
+                emoji = _SIGNAL_EMOJI.get(r.buy_signal, "")
+                name_part = f"（{r.name}）" if r.name and r.name != r.code else ""
+                lines.append(f"**{r.code}**{name_part} {emoji} {r.buy_signal} · {r.signal_score}分")
+                entry = _entry_point_text(r)
+                if entry:
+                    lines.append(f"　{entry}")
+                reasons = r.signal_reasons or []
+                risks = r.risk_factors or []
+                if reasons:
+                    lines.append("　" + " · ".join(reasons))
+                if risks:
+                    lines.append("　⚠ " + " · ".join(risks))
+                lines.append("")
+
         # --- 重点新闻 ---
         if news_map:
-            lines.append("## 重点新闻（RSI 预警股票）")
+            lines.append("## 重点新闻（买入信号股票）")
             lines.append("")
-            for r in flagged:
+            for r in results:
                 titles = news_map.get(r.code)
                 if not titles:
                     continue
@@ -522,6 +566,28 @@ def _fmt_change(pct: float) -> str:
     if pct < 0:
         return f"{pct:.2f}%"
     return "0.00%"
+
+
+def _entry_point_text(r: "StockScreenResult") -> str:
+    """生成简短的买入点或卖出点提示文本。"""
+    sig = r.buy_signal
+    if sig in ("强烈买入", "买入"):
+        parts = []
+        if r.ma5 > 0:
+            parts.append(f"MA5≈{r.ma5:.2f}")
+        if r.ma10 > 0:
+            parts.append(f"MA10≈{r.ma10:.2f}")
+        buy_str = " / ".join(parts) if parts else "-"
+        stop = f"MA20×0.97≈{r.ma20 * 0.97:.2f}" if r.ma20 > 0 else "-"
+        return f"买点：{buy_str} | 止损：{stop}"
+    if sig in ("卖出", "强烈卖出"):
+        stop = f"MA5≈{r.ma5:.2f}" if r.ma5 > 0 else "-"
+        resist = f"近期高点≈{r.resistance_levels[0]:.2f}" if r.resistance_levels else "-"
+        return f"止损：{stop} | 压力：{resist}"
+    if sig == "持有":
+        stop = f"MA10≈{r.ma10:.2f}" if r.ma10 > 0 else "-"
+        return f"持仓止损参考：{stop}"
+    return ""
 
 
 def _fmt_revenue(val) -> str:
