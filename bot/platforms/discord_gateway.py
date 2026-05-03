@@ -146,10 +146,11 @@ class DiscordGatewayClient:
 
         # 裸股票代码自动补 /stock 前缀
         # 例如：@ Bot 发 "TSLA" → "/stock TSLA"；"600519" → "/stock 600519"
+        # 只对原始内容已是大写/数字的情况触发，避免把 "help"/"skill" 等词误识别为股票代码
         if not content.startswith("/"):
             import re as _re
-            bare = content.strip().upper()
-            if _re.match(r'^(\d{6}|HK\d{5}|[A-Z]{1,5}(\.[A-Z]{1,2})?)$', bare):
+            bare = content.strip()
+            if bare == bare.upper() and _re.match(r'^(\d{6}|HK\d{5}|[A-Z]{1,5}(\.[A-Z]{1,2})?)$', bare):
                 content = f"/stock {bare}"
 
         if not content:

@@ -49,6 +49,11 @@ HISTORY_DAYS = 90
 # 并发抓取数据的最大线程数
 MAX_FETCH_WORKERS = 8
 
+# 雷达捕捉：从 FMP 榜单最多扫描多少只候选股
+MAX_RADAR_CANDIDATES = 15
+# 雷达捕捉：报告中最多展示多少只
+MAX_RADAR_RESULTS = 8
+
 # 信号优先级排序（强烈买入 → 买入 → 持有 → 观望 → 卖出 → 强烈卖出）
 _SIGNAL_ORDER = {
     "强烈买入": 0,
@@ -205,6 +210,15 @@ class DigestPipeline:
             # yfinance 补充财报日历（FMP 免费套餐覆盖率低，只含少量热门股）
             earnings = _supplement_earnings_yfinance(earnings, us_codes_all, days_ahead=7)
 
+        # 4.5 FMP 雷达捕捉：成交量异动榜 + 涨幅榜，发现自选股以外的机会
+        radar_results: List[StockScreenResult] = []
+        if not dry_run and self.fmp.is_available:
+            try:
+                radar_results = self._discover_candidates(codes)
+                logger.info("[Digest] 雷达捕捉: 发现 %d 只候选标的", len(radar_results))
+            except Exception as exc:
+                logger.warning("[Digest] 雷达捕捉失败（不影响主报告）: %s", exc)
+
         # 5. 拼装报告
         report = self._format_report(
             results=ok_results,
@@ -212,6 +226,7 @@ class DigestPipeline:
             news_map=news_map,
             earnings=earnings,
             economic=economic,
+            radar_results=radar_results,
         )
 
         logger.info("[Digest] 报告生成完毕，总耗时 %.1fs", time.time() - t0)
@@ -243,6 +258,164 @@ class DigestPipeline:
         if content and not no_notify:
             self.send(content)
         return content
+
+    # ------------------------------------------------------------------
+    # 内部：FMP 雷达捕捉
+    # ------------------------------------------------------------------
+
+    def _discover_candidates(
+        self, watchlist_codes: List[str]
+    ) -> List["StockScreenResult"]:
+        """
+        多路信号融合，发现自选股以外的美股机会。
+
+        信号来源（优先级由高到低）：
+          1. FMP 今日财报 → 财报日是最强的单日异动催化剂
+          2. FMP 盘前/盘后异动榜 → 财报后的第一波量价变化
+          3. FMP 当日成交量异动榜 → 量先于价
+          4. FMP 当日涨幅榜 → 价格已经在动
+          5. 新闻 ticker 提取 → 从"beat/guidance"标题捕捉尚未上榜的标的
+
+        流程：
+          - 各来源合并去重，watchlist 内的排除
+          - 财报日标的强制进入（不受 MAX_RADAR_CANDIDATES 限制，最多 10 只）
+          - 其余按成交量降序取 MAX_RADAR_CANDIDATES 只
+          - 全部做技术指标筛选，只保留买入/持有信号
+        """
+        watchlist_set = {c.upper() for c in watchlist_codes}
+
+        # ── 1. 今日财报（最高优先级，强制进入扫描）──────────────────────
+        earnings_today_syms = self.fmp.get_earnings_today()
+        earnings_forced: List[str] = []
+        for sym in earnings_today_syms:
+            if sym not in watchlist_set:
+                earnings_forced.append(sym)
+        earnings_forced = earnings_forced[:10]  # 最多 10 只避免超量
+
+        # ── 2. 盘前/盘后异动 ────────────────────────────────────────────
+        candidates: Dict[str, Dict] = {}
+        for item in self.fmp.get_prepost_market_actives(limit=20):
+            sym = item["symbol"]
+            if sym not in watchlist_set:
+                item["_source"] = "盘前/盘后"
+                candidates[sym] = item
+
+        # ── 3. 当日成交量异动 ────────────────────────────────────────────
+        for item in self.fmp.get_market_actives(limit=20):
+            sym = item["symbol"]
+            if sym not in watchlist_set and sym not in candidates:
+                item["_source"] = "量异动"
+                candidates[sym] = item
+
+        # ── 4. 当日涨幅榜 ────────────────────────────────────────────────
+        for item in self.fmp.get_market_gainers(limit=20):
+            sym = item["symbol"]
+            if sym not in watchlist_set and sym not in candidates:
+                item["_source"] = "涨幅榜"
+                candidates[sym] = item
+
+        # ── 5. 新闻 ticker 提取 ──────────────────────────────────────────
+        if self.search_service and self.search_service.is_available:
+            all_known = watchlist_set | set(candidates.keys()) | set(earnings_forced)
+            news_tickers = self._extract_news_tickers(all_known)
+            for sym in news_tickers:
+                if sym not in candidates:
+                    candidates[sym] = {
+                        "symbol": sym, "name": sym,
+                        "price": 0.0, "change_pct": 0.0, "volume": 0,
+                        "_source": "新闻捕捉",
+                    }
+
+        if not candidates and not earnings_forced:
+            logger.info("[Digest] 雷达捕捉: 无新候选标的（与自选股完全重叠）")
+            return []
+
+        # ── 组装扫描列表：财报日强制 + 其余按成交量取 TOP ────────────────
+        sorted_cands = sorted(
+            candidates.values(),
+            key=lambda x: x.get("volume", 0),
+            reverse=True,
+        )
+        vol_top = [c["symbol"] for c in sorted_cands[:MAX_RADAR_CANDIDATES]]
+        # 财报日标的优先，不重复
+        to_screen_ordered = earnings_forced + [s for s in vol_top if s not in earnings_forced]
+        to_screen = list(dict.fromkeys(to_screen_ordered))  # 去重保序
+
+        logger.info(
+            "[Digest] 雷达捕捉: 共 %d 只候选（财报日 %d 只，榜单/新闻 %d 只）",
+            len(to_screen), len(earnings_forced), len(to_screen) - len(earnings_forced),
+        )
+
+        screen = self._screen_all(to_screen)
+
+        # 只保留有买入/持有信号且无错误的
+        buy_results = [
+            r for r in screen
+            if not r.error and r.buy_signal in ("强烈买入", "买入", "持有")
+        ]
+        # 补充来源标记和涨跌幅
+        for r in buy_results:
+            if r.code in earnings_forced and r.code not in candidates:
+                source_tag = "财报日"
+            else:
+                src = candidates.get(r.code, {})
+                source_tag = src.get("_source", "")
+                # 财报日 + 其他来源叠加
+                if r.code in earnings_forced:
+                    source_tag = "财报日+" + source_tag if source_tag else "财报日"
+                if src.get("change_pct") and r.price_change_pct == 0.0:
+                    r.price_change_pct = src["change_pct"]
+            if source_tag:
+                r.signal_reasons = list(r.signal_reasons or []) + [f"来源:{source_tag}"]
+
+        buy_results.sort(
+            key=lambda r: (_SIGNAL_ORDER.get(r.buy_signal, 3), -r.signal_score)
+        )
+        return buy_results[:MAX_RADAR_RESULTS]
+
+    def _extract_news_tickers(self, exclude: set) -> List[str]:
+        """
+        搜索财报/催化剂新闻，用正则从标题提取美股 ticker。
+
+        搜索词针对"财报超预期""上调指引"等强催化剂场景，
+        从结果标题中提取 $TICKER 格式或独立全大写词，
+        过滤掉常见非股票缩写后返回。
+        """
+        import re
+
+        # 常见非 ticker 的全大写词
+        _FALSE_POSITIVES = {
+            "US", "UK", "EU", "AI", "IT", "EV", "IPO", "ETF", "CEO", "CFO",
+            "COO", "CTO", "NYSE", "SEC", "FDA", "FED", "GDP", "CPI", "EPS",
+            "FOR", "AND", "THE", "INC", "LLC", "LTD", "WITH", "FROM", "THIS",
+            "BEAT", "MISS", "SAYS", "SEES", "SETS", "TOPS", "HITS", "ROSE",
+            "FELL", "UP", "DOWN", "NEW", "TOP", "BIG", "HOW", "WHY", "WHAT",
+            "AFTER", "BEFORE", "FIRST", "LAST", "NEXT", "OVER", "INTO", "THAN",
+        }
+
+        query = 'earnings beat "raised guidance" stock quarterly results'
+        tickers: List[str] = []
+        try:
+            resp = self.search_service.search(query, max_results=10, days=2)  # type: ignore[union-attr]
+            if resp.success and resp.results:
+                for item in resp.results:
+                    text = (item.title or "") + " " + (getattr(item, "snippet", "") or "")
+                    # $TICKER 格式（高可信度）
+                    dollar_found = re.findall(r'\$([A-Z]{1,5})', text)
+                    # 独立全大写 2-5 字母词
+                    bare_found = re.findall(r'(?<![A-Z])([A-Z]{2,5})(?![A-Z])', text)
+                    for sym in dollar_found + bare_found:
+                        if sym not in _FALSE_POSITIVES and sym not in exclude:
+                            tickers.append(sym)
+        except Exception as exc:
+            logger.debug("[Digest] 新闻 ticker 提取失败: %s", exc)
+
+        # 去重保序，$TICKER 命中次数多的靠前
+        from collections import Counter
+        counts = Counter(tickers)
+        unique = sorted(set(tickers), key=lambda t: -counts[t])
+        logger.info("[Digest] 新闻捕捉: 提取到 %d 个候选 ticker", len(unique))
+        return unique[:10]
 
     # ------------------------------------------------------------------
     # 内部：技术指标批量计算
@@ -442,6 +615,7 @@ class DigestPipeline:
         news_map: Dict[str, List[str]],
         earnings: List[Dict],
         economic: List[Dict],
+        radar_results: Optional[List[StockScreenResult]] = None,
     ) -> str:
         tz_cn = timezone(timedelta(hours=8))
         now = datetime.now(tz_cn)
@@ -513,6 +687,39 @@ class DigestPipeline:
                 for title in titles:
                     lines.append(f"- {title}")
                 lines.append("")
+
+        # --- 雷达捕捉（FMP 成交量异动/涨幅榜中的非自选股机会）---
+        if radar_results:
+            lines.append("## 🔍 雷达捕捉（自选股以外的机会）")
+            lines.append("")
+            lines.append("> 来自 FMP 成交量异动榜 + 涨幅榜，仅展示有买入/持有信号的标的")
+            lines.append("")
+            lines.append(f"| 代码 | 名称 | 价格 | 日涨跌 | RSI(6) | 信号 | 评分 | 来源 |")
+            lines.append("|------|------|------|--------|--------|------|------|------|")
+            for r in radar_results:
+                # 从 signal_reasons 末尾提取来源标记
+                reasons = list(r.signal_reasons or [])
+                source_tag = ""
+                clean_reasons = []
+                for reason in reasons:
+                    if reason.startswith("来源:"):
+                        source_tag = reason[3:]
+                    else:
+                        clean_reasons.append(reason)
+                emoji = _SIGNAL_EMOJI.get(r.buy_signal, "")
+                name_display = r.name if r.name and r.name != r.code else "-"
+                lines.append(
+                    f"| {r.code} | {name_display} | {r.price:.2f} "
+                    f"| {_fmt_change(r.price_change_pct)} | {r.rsi_6} "
+                    f"| {emoji} {r.buy_signal} | {r.signal_score} | {source_tag} |"
+                )
+            lines.append("")
+            # 每只雷达股票的信号理由
+            for r in radar_results:
+                reasons = [x for x in (r.signal_reasons or []) if not x.startswith("来源:")]
+                if reasons:
+                    lines.append(f"**{r.code}**: " + " · ".join(reasons))
+            lines.append("")
 
         # --- 财报日历 ---
         if earnings:

@@ -107,6 +107,172 @@ class FmpFetcher:
         return bool(self.api_key)
 
     # ──────────────────────────────────────────────
+    # 市场扫描（成交量/涨幅/跌幅榜）
+    # ──────────────────────────────────────────────
+
+    def _get_market_movers(self, endpoint: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        通用市场异动榜获取。
+
+        Args:
+            endpoint: FMP stable 路径，如 "actives"/"gainers"/"losers"
+            limit:    最多返回条数
+
+        Returns:
+            标准化列表，每项包含：
+              symbol   str    股票代码
+              name     str    公司名
+              price    float  当前价格
+              change_pct float 涨跌幅 %
+              volume   int   成交量
+        """
+        if not self.is_available:
+            logger.debug("[FMP] 未配置 API key，跳过市场扫描 %s", endpoint)
+            return []
+
+        url = f"{_FMP_BASE}/stock_market/{endpoint}?apikey={self.api_key}"
+        try:
+            raw = _fetch_json(url)
+        except HTTPError as e:
+            logger.warning("[FMP] 市场扫描 %s HTTP 错误: %s %s", endpoint, e.code, e.reason)
+            return []
+        except (URLError, OSError) as e:
+            logger.warning("[FMP] 市场扫描 %s 网络错误: %s", endpoint, e)
+            return []
+        except Exception as e:
+            logger.warning("[FMP] 市场扫描 %s 解析失败: %s", endpoint, e)
+            return []
+
+        if not isinstance(raw, list):
+            logger.warning("[FMP] 市场扫描 %s 返回格式异常: %s", endpoint, type(raw))
+            return []
+
+        results = []
+        for item in raw[:limit]:
+            sym = (item.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            try:
+                price = float(item.get("price") or 0)
+                change_pct = float(item.get("changesPercentage") or item.get("change_percentage") or 0)
+                volume = int(item.get("volume") or 0)
+            except (TypeError, ValueError):
+                price, change_pct, volume = 0.0, 0.0, 0
+            results.append({
+                "symbol":     sym,
+                "name":       item.get("name") or sym,
+                "price":      price,
+                "change_pct": change_pct,
+                "volume":     volume,
+            })
+
+        logger.info("[FMP] 市场扫描 %s: 获取 %d 条", endpoint, len(results))
+        return results
+
+    def get_market_actives(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """当日成交量异动榜（最有可能包含 MXL 这类事件驱动标的）。"""
+        return self._get_market_movers("actives", limit)
+
+    def get_market_gainers(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """当日涨幅榜 Top N。"""
+        return self._get_market_movers("gainers", limit)
+
+    def get_market_losers(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """当日跌幅榜 Top N（抄底候选）。"""
+        return self._get_market_movers("losers", limit)
+
+    def get_earnings_today(self) -> List[str]:
+        """
+        获取今日发布财报的美股代码列表。
+
+        财报日是最强的单日异动催化剂（如 MXL），提前捕捉可在放量前布局。
+        返回代码列表（上游自行决定是否纳入技术筛选）。
+        """
+        if not self.is_available:
+            logger.debug("[FMP] 未配置 API key，跳过今日财报获取")
+            return []
+
+        today = date.today().isoformat()
+        url = f"{_FMP_BASE}/earnings-calendar?from={today}&to={today}&apikey={self.api_key}"
+        try:
+            raw = _fetch_json(url)
+        except HTTPError as e:
+            logger.warning("[FMP] 今日财报 HTTP 错误: %s %s", e.code, e.reason)
+            return []
+        except (URLError, OSError) as e:
+            logger.warning("[FMP] 今日财报网络错误: %s", e)
+            return []
+        except Exception as e:
+            logger.warning("[FMP] 今日财报解析失败: %s", e)
+            return []
+
+        if not isinstance(raw, list):
+            return []
+
+        symbols = [
+            item.get("symbol", "").strip().upper()
+            for item in raw
+            if item.get("symbol")
+        ]
+        symbols = list(dict.fromkeys(s for s in symbols if s))  # dedupe，保序
+        logger.info("[FMP] 今日财报: %d 只股票", len(symbols))
+        return symbols
+
+    def get_prepost_market_actives(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        盘前/盘后异动榜（FMP stable/pre-post-market-most-active）。
+
+        财报通常在盘前/盘后发布，此接口比常规 actives 早几小时，
+        能更早捕捉到 MXL 这类因财报驱动的异动。
+        """
+        if not self.is_available:
+            logger.debug("[FMP] 未配置 API key，跳过盘前/盘后异动获取")
+            return []
+
+        url = f"{_FMP_BASE}/pre-post-market-most-active?apikey={self.api_key}"
+        try:
+            raw = _fetch_json(url)
+        except HTTPError as e:
+            logger.warning("[FMP] 盘前/盘后异动 HTTP 错误: %s %s", e.code, e.reason)
+            return []
+        except (URLError, OSError) as e:
+            logger.warning("[FMP] 盘前/盘后异动网络错误: %s", e)
+            return []
+        except Exception as e:
+            logger.warning("[FMP] 盘前/盘后异动解析失败: %s", e)
+            return []
+
+        if not isinstance(raw, list):
+            logger.warning("[FMP] 盘前/盘后异动返回格式异常: %s", type(raw))
+            return []
+
+        results = []
+        for item in raw[:limit]:
+            sym = (item.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            try:
+                price = float(
+                    item.get("price") or item.get("lastSalePrice") or 0
+                )
+                change_pct = float(
+                    item.get("changesPercentage") or item.get("priceChange") or 0
+                )
+                volume = int(item.get("volume") or 0)
+            except (TypeError, ValueError):
+                price, change_pct, volume = 0.0, 0.0, 0
+            results.append({
+                "symbol":     sym,
+                "name":       item.get("name") or item.get("companyName") or sym,
+                "price":      price,
+                "change_pct": change_pct,
+                "volume":     volume,
+            })
+
+        logger.info("[FMP] 盘前/盘后异动: 获取 %d 条", len(results))
+        return results
+
+    # ──────────────────────────────────────────────
     # 宏观经济日历
     # ──────────────────────────────────────────────
 

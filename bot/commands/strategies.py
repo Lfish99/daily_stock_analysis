@@ -29,7 +29,7 @@ class StrategiesCommand(BotCommand):
 
     @property
     def aliases(self) -> List[str]:
-        return ["skills", "策略", "策略列表"]
+        return ["skill", "strategy", "skills", "策略", "策略列表"]
 
     @property
     def description(self) -> str:
@@ -49,11 +49,9 @@ class StrategiesCommand(BotCommand):
 
             config = get_config()
             sm = get_skill_manager(config)
-            from src.agent.factory import DEFAULT_AGENT_SKILLS
 
-            # Derive activation status from config without mutating the skill
-            # manager — this is a read-only listing command.
-            configured_active: set = set(config.agent_skills or DEFAULT_AGENT_SKILLS)
+            # 空列表表示全部激活（未配置时默认全开）
+            configured_active: set = set(config.agent_skills) if config.agent_skills else {s.name for s in sm.list_skills()}
 
             all_skills = sm.list_skills()
             if not all_skills:
